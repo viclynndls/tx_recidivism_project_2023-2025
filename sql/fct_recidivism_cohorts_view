@@ -1,0 +1,122 @@
+CREATE OR REPLACE VIEW `texas-recidivism-rates.texas_criminal_justice.fct_recidivism_cohorts` AS
+
+WITH parsed_releases AS (
+  SELECT *,
+    CASE 
+      WHEN LOWER(sentenceyears) LIKE '%month%' THEN 'MONTH'
+      WHEN LOWER(sentenceyears) LIKE '%year%' THEN 'YEAR'
+      WHEN sentenceyears IN ('Life', 'Capital Life', 'Life w/o Parole', 'Death') THEN 'LIFE'
+      WHEN sentenceyears IN ('SAFPF', 'ISF') THEN 'TREATMENT'
+      ELSE 'OTHER'
+    END AS r_unit,
+    SAFE_CAST(REGEXP_EXTRACT(sentenceyears, r'([0-9]+)') AS FLOAT64) AS r_num1,
+    SAFE_CAST(REGEXP_EXTRACT(sentenceyears, r'[0-9]+\s*(?:to|&)\s*([0-9]+)') AS FLOAT64) AS r_num2
+  FROM `texas-recidivism-rates.texas_criminal_justice.stg_raw_releases`
+),
+
+parsed_receives AS (
+  SELECT *,
+    CASE 
+      WHEN LOWER(sentenceyears) LIKE '%month%' THEN 'MONTH'
+      WHEN LOWER(sentenceyears) LIKE '%year%' THEN 'YEAR'
+      WHEN sentenceyears IN ('Life', 'Capital Life', 'Life w/o Parole', 'Death') THEN 'LIFE'
+      WHEN sentenceyears IN ('SAFPF', 'ISF') THEN 'TREATMENT'
+      ELSE 'OTHER'
+    END AS c_unit,
+    SAFE_CAST(REGEXP_EXTRACT(sentenceyears, r'([0-9]+)') AS FLOAT64) AS c_num1,
+    SAFE_CAST(REGEXP_EXTRACT(sentenceyears, r'[0-9]+\s*(?:to|&)\s*([0-9]+)') AS FLOAT64) AS c_num2
+  FROM `texas-recidivism-rates.texas_criminal_justice.stg_raw_receives`
+),
+
+clean_releases AS (
+  SELECT
+    UPPER(TRIM(gender)) AS gender,
+    UPPER(TRIM(race)) AS race,
+    UPPER(TRIM(county)) AS county,
+    UPPER(TRIM(offense)) AS offense,
+    
+    CASE 
+      WHEN r_unit = 'LIFE' THEN 80.0
+      WHEN r_unit = 'TREATMENT' THEN 0.75
+      WHEN r_num2 IS NOT NULL THEN (CASE WHEN r_unit = 'YEAR' THEN (r_num1 + r_num2) / 2.0 ELSE ((r_num1 + r_num2) / 2.0) / 12.0 END)
+      WHEN r_num1 IS NOT NULL THEN (CASE WHEN r_unit = 'YEAR' THEN r_num1 ELSE r_num1 / 12.0 END)
+      ELSE NULL
+    END AS sentence_years_numeric,
+
+    PARSE_DATE('%Y-%m-%d', LEFT(releasedate, 10)) AS release_date,
+    PARSE_DATE('%Y-%m-%d', LEFT(offensedate, 10)) AS offense_date,
+    data_cohort_year
+  FROM parsed_releases
+),
+
+clean_receives AS (
+  SELECT
+    UPPER(TRIM(gender)) AS gender,
+    UPPER(TRIM(race)) AS race,
+    UPPER(TRIM(county)) AS county,
+    UPPER(TRIM(offense)) AS offense,
+    
+    CASE 
+      WHEN c_unit = 'LIFE' THEN 80.0
+      WHEN c_unit = 'TREATMENT' THEN 0.75
+      WHEN c_num2 IS NOT NULL THEN (CASE WHEN c_unit = 'YEAR' THEN (c_num1 + c_num2) / 2.0 ELSE ((c_num1 + c_num2) / 2.0) / 12.0 END)
+      WHEN c_num1 IS NOT NULL THEN (CASE WHEN c_unit = 'YEAR' THEN c_num1 ELSE c_num1 / 12.0 END)
+      ELSE NULL
+    END AS sentence_years_numeric,
+
+    PARSE_DATE('%Y-%m-%d', LEFT(receivedate, 10)) AS receive_date,
+    PARSE_DATE('%Y-%m-%d', LEFT(offensedate, 10)) AS offense_date
+  FROM parsed_receives
+)
+
+SELECT
+  r.data_cohort_year,
+  r.gender,
+  r.race,
+  r.county,
+  r.offense,
+  r.sentence_years_numeric, 
+
+  CASE 
+    WHEN r.sentence_years_numeric IS NULL THEN 'Unknown'
+    WHEN r.sentence_years_numeric < 2.0 THEN 'Short-Term (< 2 Years)'
+    WHEN r.sentence_years_numeric >= 2.0 AND r.sentence_years_numeric <= 5.0 THEN 'Mid-Tier (2-5 Years)'
+    WHEN r.sentence_years_numeric > 5.0 AND r.sentence_years_numeric <= 10.0 THEN 'Long (5-10 Years)'
+    WHEN r.sentence_years_numeric > 10.0 AND r.sentence_years_numeric <= 20.0 THEN 'Very Long (10-20 Years)'
+    WHEN r.sentence_years_numeric > 20.0 THEN 'Extreme / Life (20+ Years)'
+  END AS sentence_severity_tier,
+
+  r.release_date,
+  
+  MIN(c.receive_date) AS first_return_date,
+  DATE_DIFF(MIN(c.receive_date), r.release_date, DAY) AS days_to_return,
+  
+  CASE 
+    WHEN MIN(c.receive_date) IS NOT NULL THEN 1 
+    ELSE 0 
+  END AS returned_at_all,
+
+  CASE 
+    WHEN MIN(c.receive_date) IS NULL THEN 'No Return Documented'
+    WHEN DATE_DIFF(MIN(c.receive_date), r.release_date, DAY) <= 180 THEN 'Rapid Return (< 6 Months)'
+    WHEN DATE_DIFF(MIN(c.receive_date), r.release_date, DAY) BETWEEN 181 AND 365 THEN 'Returned (6-12 Months)'
+    WHEN DATE_DIFF(MIN(c.receive_date), r.release_date, DAY) BETWEEN 366 AND 730 THEN 'Returned (1-2 Years)'
+    ELSE 'Returned (> 2 Years)'
+  END AS recidivism_time_horizon
+
+FROM clean_releases r
+LEFT JOIN clean_receives c 
+  ON r.gender = c.gender
+  AND r.race = c.race
+  AND r.county = c.county
+  AND r.offense_date = c.offense_date
+  AND c.receive_date > r.release_date
+
+GROUP BY 
+  r.data_cohort_year, 
+  r.gender, 
+  r.race, 
+  r.county, 
+  r.offense, 
+  r.sentence_years_numeric, 
+  r.release_date;
