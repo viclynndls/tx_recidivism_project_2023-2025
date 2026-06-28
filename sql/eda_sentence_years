@@ -1,0 +1,39 @@
+SELECT 
+  sentenceyears, 
+  COUNT(*) AS record_count
+FROM `texas-recidivism-rates.texas_criminal_justice.stg_raw_receives`
+GROUP BY sentenceyears
+ORDER BY record_count DESC;
+
+SELECT 
+  sentenceyears, 
+  COUNT(*) AS record_count
+FROM `texas-recidivism-rates.texas_criminal_justice.stg_raw_releases`
+GROUP BY sentenceyears
+ORDER BY record_count DESC;
+
+
+WITH release_sentences AS (
+  SELECT DISTINCT sentenceyears AS release_val
+  FROM `texas-recidivism-rates.texas_criminal_justice.stg_raw_releases`
+  WHERE sentenceyears IS NOT NULL
+),
+
+receive_sentences AS (
+  SELECT DISTINCT sentenceyears AS receive_val
+  FROM `texas-recidivism-rates.texas_criminal_justice.stg_raw_receives`
+  WHERE sentenceyears IS NOT NULL
+)
+
+SELECT 
+  rel.release_val AS in_releases,
+  rec.receive_val AS in_receives,
+  CASE 
+    WHEN rel.release_val IS NULL THEN '❌ Missing from RELEASES'
+    WHEN rec.receive_val IS NULL THEN '❌ Missing from RECEIVES'
+    ELSE '✅ Perfect Match'
+  END AS alignment_status
+FROM release_sentences rel
+FULL OUTER JOIN receive_sentences rec 
+  ON rel.release_val = rec.receive_val
+ORDER BY alignment_status ASC, in_releases ASC;
